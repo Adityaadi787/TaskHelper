@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8" /><title>Shadow DOM Fixture</title></head>
+<body>
+  <h1>Shadow Host Page</h1>
+  <p>Regular light-DOM paragraph with visible-marker-outside text.</p>
+  <div id="host"></div>
+  <script>
+    const host = document.getElementById('host');
+    const shadow = host.attachShadow({mode: 'open'});
+    shadow.innerHTML = '<p>Shadow content contains shadow-marker-inside for verification.</p>';
+  </script>
+</body>
+</html>

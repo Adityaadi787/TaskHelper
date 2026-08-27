@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  taskhelper:
+    build: .
+    container_name: taskhelper
+    environment:
+      - LOG_LEVEL=INFO
+      - BROWSER_MODE=local
+      - HEADLESS=true
+      - DATABASE_PATH=data/taskhelper.db
+    volumes:
+      - ./data:/app/data
+    command: ["python", "main.py", "--recent"]
