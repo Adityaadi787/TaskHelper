@@ -28,23 +28,28 @@ async def _run_cli_task(task_text: str) -> int:
     config = Config()
     config.ensure_database_dir()
     engine = TaskEngine(config)
-    result = await engine.run(task_text)
-
-    if result.success:
-        print(f"Answer: {result.result.answer}")
-        if result.result.url:
-            print(f"Source: {result.result.url}")
-        return 0
-    print(f"Task failed: {result.result.error}", file=sys.stderr)
-    return 1
+    try:
+        result = await engine.run(task_text)
+        if result.success:
+            print(f"Answer: {result.result.answer}")
+            if result.result.url:
+                print(f"Source: {result.result.url}")
+            return 0
+        print(f"Task failed: {result.result.error}", file=sys.stderr)
+        return 1
+    finally:
+        engine.close()
 
 
 def _show_recent(limit: int = 10) -> int:
     config = Config()
     memory = Memory(config.database_path)
-    for record in memory.recent_tasks(limit=limit):
-        print(f"[{record.id}] ({record.status}) {record.original_task!r} -> {record.answer!r}")
-    return 0
+    try:
+        for record in memory.recent_tasks(limit=limit):
+            print(f"[{record.id}] ({record.status}) {record.original_task!r} -> {record.answer!r}")
+        return 0
+    finally:
+        memory.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -58,8 +63,12 @@ def main(argv: list[str] | None = None) -> int:
     _setup_logging(config.log_level)
 
     if args.discord:
-        from discord_bot import run_bot
-        run_bot()
+        try:
+            from discord_bot import run_bot
+            run_bot()
+        except Exception as exc:
+            logging.getLogger("taskhelper.main").error("Discord startup failed: %s", exc)
+            return 2
         return 0
 
     if args.recent:
@@ -69,7 +78,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 1
 
-    return asyncio.run(_run_cli_task(args.task))
+    try:
+        return asyncio.run(_run_cli_task(args.task))
+    except Exception as exc:
+        logging.getLogger("taskhelper.main").error("CLI task failed: %s", exc)
+        return 2
 
 
 if __name__ == "__main__":

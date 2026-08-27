@@ -64,7 +64,7 @@ class BrowserAgent:
         url = search_url_template.format(query=_url_encode(query))
         await self.manager.goto_with_retry(page, url)
 
-    async def collect_candidates(self, page: Page, query: str, target_site: str | None) -> list[Candidate]:
+    async def collect_candidates(self, page: Page, query: str, target_site: str | None, limit: int = 10) -> list[Candidate]:
         """Gather and score result links from whatever page we're on.
 
         Works generically against any results page: it inspects every
@@ -73,7 +73,7 @@ class BrowserAgent:
         """
         anchors = await page.eval_on_selector_all(
             "a[href]",
-            "els => els.map(e => ({href: e.href, text: e.innerText.trim()}))",
+            "els => els.map(e => ({href: e.href, text: [e.innerText, e.getAttribute('title'), e.getAttribute('aria-label')].filter(Boolean).join(' ').trim()}))",
         )
         candidates: list[Candidate] = []
         seen: set[str] = set()
@@ -91,7 +91,7 @@ class BrowserAgent:
             if score > 0:
                 candidates.append(Candidate(url=href, text=text, score=score))
         candidates.sort(key=lambda c: c.score, reverse=True)
-        return candidates
+        return candidates[: max(1, limit)]
 
     async def open_candidate(self, page: Page, candidate: Candidate) -> None:
         await self.manager.goto_with_retry(page, candidate.url)

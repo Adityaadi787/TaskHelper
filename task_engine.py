@@ -4,6 +4,7 @@ is runnable independently of any Discord bot (see main.py)."""
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -48,31 +49,53 @@ class TaskEngine:
         self.detector = TaskDetector()
         self.memory = memory or Memory(self.config.database_path)
 
+    def close(self) -> None:
+        """Close the engine-owned SQLite connection."""
+        self.memory.close()
+
     async def run(self, raw_task: str) -> EngineResult:
         parsed = self.detector.parse(raw_task)
         record = TaskRecord(
             original_task=raw_task,
             task_type=parsed.task_type,
             search_query=parsed.search_query,
+            points=self._extract_points(raw_task),
+            metadata={"section_hint": parsed.section_hint} if parsed.section_hint else {},
             status="pending",
         )
         task_id = self.memory.save_task(record)
 
-        async with BrowserManager(self.config.browser) as manager:
-            executor = TaskExecutor(manager, self.config)
-            result = await executor.execute(parsed)
+        try:
+            async with BrowserManager(self.config.browser) as manager:
+                executor = TaskExecutor(manager, self.config)
+                result = await executor.execute(parsed)
+        except Exception as exc:  # browser/database-independent top-level safety boundary
+            logger.exception("Task engine failed before task execution completed")
+            result = TaskResult(success=False, error=f"Task engine error: {exc}")
 
         self.memory.update_task(
             task_id,
             answer=self._serialize_answer(result.answer),
             url=result.url,
-            location=result.location,
-            metadata=result.metadata,
+            location=result.location or parsed.section_hint,
+            rule=parsed.extraction.kind,
+            points=record.points,
+            metadata={**record.metadata, **result.metadata},
             status="success" if result.success else "failed",
             error=result.error,
         )
 
         return EngineResult(raw_task=raw_task, parsed=parsed, result=result, task_id=task_id)
+
+    @staticmethod
+    def _extract_points(raw_task: str) -> float | None:
+        match = re.search(
+            r"\b(?:(?:points?|pts?)\s*[:=]?\s*(\d+(?:\.\d+)?)|"
+            r"(\d+(?:\.\d+)?)\s*(?:points?|pts?))\b",
+            raw_task,
+            re.IGNORECASE,
+        )
+        return float(match.group(1) or match.group(2)) if match else None
 
     @staticmethod
     def _serialize_answer(answer: Any) -> str | None:

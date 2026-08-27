@@ -30,6 +30,7 @@ class TestImports(unittest.TestCase):
         import extractor  # noqa: F401
         import main  # noqa: F401
         import memory  # noqa: F401
+        import reporter  # noqa: F401
         import task_detector  # noqa: F401
         import task_engine  # noqa: F401
         import task_executor  # noqa: F401
@@ -255,13 +256,17 @@ class TestMemory(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.db_path = str(Path(self.tmpdir.name) / "test.db")
+        self.memories = []
 
     def tearDown(self):
+        for mem in self.memories:
+            mem.close()
         self.tmpdir.cleanup()
 
     def test_save_and_get_task(self):
         from memory import Memory, TaskRecord
         mem = Memory(self.db_path)
+        self.memories.append(mem)
         task_id = mem.save_task(TaskRecord(original_task="do X", task_type="web_search"))
         record = mem.get_task(task_id)
         self.assertEqual(record.original_task, "do X")
@@ -270,6 +275,7 @@ class TestMemory(unittest.TestCase):
     def test_update_task(self):
         from memory import Memory, TaskRecord
         mem = Memory(self.db_path)
+        self.memories.append(mem)
         task_id = mem.save_task(TaskRecord(original_task="do Y"))
         mem.update_task(task_id, answer="42", status="success", metadata={"k": "v"})
         record = mem.get_task(task_id)
@@ -280,6 +286,7 @@ class TestMemory(unittest.TestCase):
     def test_update_unknown_column_raises(self):
         from memory import Memory, TaskRecord
         mem = Memory(self.db_path)
+        self.memories.append(mem)
         task_id = mem.save_task(TaskRecord(original_task="do Z"))
         with self.assertRaises(ValueError):
             mem.update_task(task_id, not_a_real_column="x")
@@ -287,6 +294,7 @@ class TestMemory(unittest.TestCase):
     def test_find_similar_only_matches_success(self):
         from memory import Memory, TaskRecord
         mem = Memory(self.db_path)
+        self.memories.append(mem)
         mem.save_task(TaskRecord(original_task="a", search_query="python testing", status="failed"))
         mem.save_task(TaskRecord(original_task="b", search_query="python testing", status="success"))
         results = mem.find_similar("python testing")
@@ -296,6 +304,7 @@ class TestMemory(unittest.TestCase):
     def test_recent_tasks_ordering(self):
         from memory import Memory, TaskRecord
         mem = Memory(self.db_path)
+        self.memories.append(mem)
         first = mem.save_task(TaskRecord(original_task="first"))
         second = mem.save_task(TaskRecord(original_task="second"))
         recent = mem.recent_tasks(limit=5)
@@ -305,6 +314,7 @@ class TestMemory(unittest.TestCase):
     def test_in_memory_database(self):
         from memory import Memory, TaskRecord
         mem = Memory(":memory:")
+        self.memories.append(mem)
         task_id = mem.save_task(TaskRecord(original_task="ephemeral"))
         self.assertIsNotNone(mem.get_task(task_id))
 
@@ -478,3 +488,170 @@ class TestPlaywrightRealBrowser(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestHardeningAndIntegration(unittest.TestCase):
+    def test_config_rejects_invalid_values(self):
+        from config import BrowserConfig, Config
+        with self.assertRaises(ValueError):
+            BrowserConfig(viewport_width=100)
+        with self.assertRaises(ValueError):
+            BrowserConfig(max_retries=0)
+        with self.assertRaises(ValueError):
+            Config(default_search_url="https://example.com/search")
+
+    def test_interaction_delay_is_configurable(self):
+        from config import BrowserConfig
+        cfg = BrowserConfig(interaction_delay_ms=25)
+        self.assertEqual(cfg.interaction_delay_ms, 25)
+
+    def test_memory_stale_filter_and_fields(self):
+        from memory import Memory, TaskRecord
+        mem = Memory(":memory:")
+        task_id = mem.save_task(TaskRecord(
+            original_task="old", task_type="web_search", search_query="alpha",
+            answer="42", location="heading", rule="heading", url="https://example.test",
+            points=3, metadata={"source": "test"}, status="success",
+        ))
+        row = mem.get_task(task_id)
+        self.assertEqual(row.points, 3)
+        self.assertEqual(row.rule, "heading")
+        self.assertFalse(mem.is_fresh(row, 0))
+        self.assertEqual(len(mem.find_similar("alpha", max_age_seconds=3600)), 1)
+        mem.close()
+
+    def test_reporter_serializes_dataclass(self):
+        from reporter import format_structured_result
+        from task_executor import TaskResult
+        text = format_structured_result(TaskResult(success=True, answer="ok"))
+        self.assertIn('"success": true', text)
+        self.assertIn('"answer": "ok"', text)
+
+    def test_youtube_extended_hints(self):
+        from task_detector import parse_task
+        parsed = parse_task(
+            'Search youtube for "demo" and target video "Target" channel "Maker" '
+            'thumbnail "red car" from 01:10 to 01:20 watch 10 seconds and return text at 01:10'
+        )
+        self.assertEqual(parsed.video.title_hint, "Target")
+        self.assertEqual(parsed.video.channel_hint, "Maker")
+        self.assertEqual(parsed.video.thumbnail_hint, "red car")
+        self.assertEqual(parsed.video.interval_start, "01:10")
+        self.assertEqual(parsed.video.interval_end, "01:20")
+        self.assertEqual(parsed.video.duration_seconds, 10)
+        self.assertEqual(parsed.video.timestamp, "01:10")
+
+    def test_youtube_url_is_classified_as_youtube(self):
+        from task_detector import parse_task
+        parsed = parse_task("Open https://www.youtube.com/watch?v=abc and give the title")
+        self.assertEqual(parsed.task_type, "youtube")
+
+    def test_empty_task_is_rejected(self):
+        from task_detector import TaskDetector
+        with self.assertRaises(ValueError):
+            TaskDetector().parse("   ")
+
+    def test_add_command_round_trip_quotes(self):
+        from discord_bot import format_add_command
+        cmd = format_add_command('A \\"quoted\\" task', 'answer \\ path')
+        self.assertTrue(cmd.startswith('!add "'))
+        self.assertIn('\\\\ path', cmd)
+
+    def test_engine_extracts_points_into_memory(self):
+        from memory import Memory
+        from task_engine import TaskEngine
+        mem = Memory(":memory:")
+        engine = TaskEngine(memory=mem)
+        self.assertEqual(engine._extract_points("complete this task for 12.5 points"), 12.5)
+        mem.close()
+
+
+
+class TestBrowserFileAndDynamicExecution(unittest.IsolatedAsyncioTestCase):
+    async def test_file_fixture_dynamic_js_and_shadow_dom(self):
+        from browser_manager import BrowserManager
+        from config import BrowserConfig
+        from extractor import ExtractionInstruction, extract
+        manager = BrowserManager(BrowserConfig(executable_path="/usr/bin/chromium"))
+        await manager.start()
+        try:
+            page = await manager.new_page()
+            await manager.goto_with_retry(page, f"file://{(FIXTURES_DIR / 'sample_page.html').resolve()}")
+            content = await manager.extract_page_content(page)
+            self.assertIn("rendered-content-marker", content.rendered_text)
+            self.assertEqual(extract(ExtractionInstruction(kind="first_n_words", n=5), content), "Introduction The quick brown fox")
+            await manager.close_page(page)
+        finally:
+            await manager.close()
+
+    async def test_accessible_iframe_text_is_included(self):
+        from browser_manager import BrowserManager
+        from config import BrowserConfig
+        manager = BrowserManager(BrowserConfig(executable_path="/usr/bin/chromium"))
+        await manager.start()
+        try:
+            page = await manager.new_page()
+            await page.set_content(
+                "<html><body><h1>Main</h1><iframe srcdoc='<p>frame-marker</p>'></iframe></body></html>"
+            )
+            content = await manager.extract_page_content(page)
+            self.assertIn("frame-marker", content.rendered_text)
+            self.assertIn("frame-marker", content.html)
+        finally:
+            await manager.close()
+
+    async def test_shadow_dom_is_visible_to_flattened_text(self):
+        from browser_manager import BrowserManager
+        from config import BrowserConfig
+        manager = BrowserManager(BrowserConfig(executable_path="/usr/bin/chromium"))
+        await manager.start()
+        try:
+            page = await manager.new_page()
+            await manager.goto_with_retry(page, f"file://{(FIXTURES_DIR / 'shadow_dom.html').resolve()}")
+            content = await manager.extract_page_content(page)
+            self.assertIn("shadow-marker-inside", content.rendered_text)
+        finally:
+            await manager.close()
+
+    async def test_cleanup_is_idempotent(self):
+        from browser_manager import BrowserManager
+        from config import BrowserConfig
+        manager = BrowserManager(BrowserConfig(executable_path="/usr/bin/chromium"))
+        await manager.start()
+        await manager.new_page()
+        await manager.close()
+        await manager.close()
+
+
+class TestPaginationWithLocalServer(unittest.IsolatedAsyncioTestCase):
+    async def test_follow_pagination_merges_multiple_local_files(self):
+        from browser_manager import BrowserManager
+        from config import BrowserConfig, Config
+        from task_detector import ParsedTask
+        from task_executor import TaskExecutor
+        from extractor import ExtractionInstruction
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            page2 = root / "page2.html"
+            page1 = root / "page1.html"
+            page2.write_text("<html><body><h1>Page Two</h1><p>beta page two</p></body></html>")
+            page1.write_text(f"<html><body><h1>Page One</h1><p>alpha page one</p><a rel='next' href='{page2.as_uri()}'>Next</a></body></html>")
+            manager = BrowserManager(BrowserConfig(executable_path="/usr/bin/chromium"))
+            await manager.start()
+            try:
+                task = ParsedTask(raw_task="multi", task_type="direct_url", target_url=page1.as_uri(), multi_page=True,
+                                  extraction=ExtractionInstruction(kind="raw"))
+                executor = TaskExecutor(manager, Config(max_pages=2))
+                result = await executor.execute(task)
+                self.assertTrue(result.success, result.error)
+                self.assertIn("alpha page one", result.answer)
+                self.assertIn("beta page two", result.answer)
+            finally:
+                await manager.close()
+
+
+class TestMainErrorHandling(unittest.TestCase):
+    def test_main_handles_missing_discord_dependency_or_token(self):
+        import main
+        code = main.main(["--discord"])
+        self.assertEqual(code, 2)

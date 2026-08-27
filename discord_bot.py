@@ -65,6 +65,13 @@ def create_bot(config: Config | None = None, engine: TaskEngine | None = None) -
     async def on_ready():  # pragma: no cover - requires live Discord connection
         logger.info("Discord bot connected as %s", bot.user)
 
+    @bot.event
+    async def on_close():  # pragma: no cover - requires live Discord connection
+        try:
+            engine.close()
+        except Exception:
+            logger.debug("Discord shutdown memory cleanup failed", exc_info=True)
+
     @bot.command(name="task")
     async def task_command(ctx: "commands.Context", *, instruction: str):  # pragma: no cover
         await ctx.send(f"Working on: {instruction}")

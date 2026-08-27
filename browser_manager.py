@@ -1,31 +1,13 @@
-"""Async Playwright browser lifecycle management.
-
-Supports two modes, selected purely via environment configuration
-(config.BrowserConfig):
-
-    local  - launches a local Chromium instance (must be installed ahead of
-             time via `playwright install chromium`; this module never
-             downloads a browser at runtime).
-    remote - connects to an existing Playwright-compatible browser server
-             over a WebSocket endpoint (BROWSER_WS_ENDPOINT), useful for
-             low-resource hosts that cannot run a browser locally.
-
-Provides bounded retries for navigation, popup/new-tab tracking, and
-guarantees page/context/browser cleanup even on failure.
-"""
+"""Reusable async Playwright lifecycle and navigation management."""
 from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
+from pathlib import Path
+from urllib.parse import urlparse
 
-from playwright.async_api import (
-    Browser,
-    BrowserContext,
-    Page,
-    Playwright,
-    TimeoutError as PlaywrightTimeoutError,
-    async_playwright,
-)
+from playwright.async_api import Browser, BrowserContext, Page, Playwright, TimeoutError as PlaywrightTimeoutError, async_playwright
 
 from config import BrowserConfig
 from extractor import PageContent
@@ -33,23 +15,22 @@ from extractor import PageContent
 logger = logging.getLogger("taskhelper.browser")
 
 
+def _safe_url(url: str) -> str:
+    parsed = urlparse(url)
+    if not parsed.query:
+        return url
+    return parsed._replace(query="[redacted-query]").geturl()
+
+
 class BrowserLaunchError(RuntimeError):
-    """Raised when the browser cannot be launched or connected to."""
+    pass
 
 
 class NavigationError(RuntimeError):
-    """Raised when a page fails to navigate after all retries."""
+    pass
 
 
 class BrowserManager:
-    """Owns a single Playwright browser + context for the process lifetime.
-
-    Usage:
-        async with BrowserManager(config) as manager:
-            page = await manager.new_page()
-            ...
-    """
-
     def __init__(self, config: BrowserConfig | None = None):
         self.config = config or BrowserConfig()
         self._playwright: Playwright | None = None
@@ -65,38 +46,18 @@ class BrowserManager:
         await self.close()
 
     async def start(self) -> None:
-        if self._browser is not None:
+        if self._browser is not None and self._context is not None:
             return
         try:
             self._playwright = await async_playwright().start()
-        except Exception as exc:  # pragma: no cover - environment dependent
-            raise BrowserLaunchError(f"Failed to start Playwright driver: {exc}") from exc
-
-        try:
             if self.config.is_remote:
-                if not self.config.ws_endpoint:
-                    raise BrowserLaunchError(
-                        "BROWSER_MODE=remote requires BROWSER_WS_ENDPOINT to be set"
-                    )
-                logger.info("Connecting to remote browser at %s", self.config.ws_endpoint)
                 self._browser = await self._playwright.chromium.connect(self.config.ws_endpoint)
             else:
-                launch_kwargs: dict = {"headless": self.config.headless}
-                if self.config.executable_path:
-                    launch_kwargs["executable_path"] = self.config.executable_path
-                logger.info("Launching local Chromium (headless=%s)", self.config.headless)
-                self._browser = await self._playwright.chromium.launch(**launch_kwargs)
-        except Exception as exc:
-            await self._safe_stop_playwright()
-            hint = (
-                "Local Chromium executable not found. Run `playwright install chromium` "
-                "as a deployment/setup step before starting the app."
-                if not self.config.is_remote
-                else "Could not reach the remote browser endpoint. Verify BROWSER_WS_ENDPOINT."
-            )
-            raise BrowserLaunchError(f"{exc}. {hint}") from exc
-
-        try:
+                kwargs = {"headless": self.config.headless}
+                executable = self.config.executable_path or shutil.which("chromium") or shutil.which("google-chrome") or shutil.which("chromium-browser")
+                if executable:
+                    kwargs["executable_path"] = executable
+                self._browser = await self._playwright.chromium.launch(**kwargs)
             self._context = await self._browser.new_context(
                 viewport={"width": self.config.viewport_width, "height": self.config.viewport_height},
                 user_agent=self.config.user_agent,
@@ -105,54 +66,74 @@ class BrowserManager:
             self._context.set_default_timeout(self.config.action_timeout_ms)
         except Exception as exc:
             await self.close()
-            raise BrowserLaunchError(f"Failed to create browser context: {exc}") from exc
-
-    async def _safe_stop_playwright(self) -> None:
-        if self._playwright is not None:
-            try:
-                await self._playwright.stop()
-            except Exception:  # pragma: no cover - best-effort cleanup
-                logger.debug("Error while stopping playwright driver", exc_info=True)
-            self._playwright = None
+            hint = (
+                "Install Chromium during setup with `playwright install chromium`."
+                if not self.config.is_remote else
+                "Verify BROWSER_WS_ENDPOINT and the remote Playwright server."
+            )
+            raise BrowserLaunchError(f"Browser startup failed: {exc}. {hint}") from exc
 
     async def new_page(self) -> Page:
         if self._context is None:
-            raise BrowserLaunchError("BrowserManager not started; call start() first")
+            raise BrowserLaunchError("BrowserManager is not started")
         page = await self._context.new_page()
         self._pages.append(page)
-
-        # Track popups/new tabs so callers can discover them without
-        # website-specific handling.
         page.on("popup", lambda popup: self._pages.append(popup))
         return page
 
+    async def _goto_file(self, page: Page, url: str) -> None:
+        parsed = urlparse(url)
+        path = Path(parsed.path)
+        if not path.exists() or not path.is_file():
+            raise NavigationError(f"Local file does not exist: {path}")
+        html = path.read_text(encoding="utf-8")
+        # Some managed Chromium environments block file:// navigation. Loading
+        # the exact fixture through set_content still executes its JavaScript.
+        await page.set_content(html, wait_until="load", timeout=self.config.navigation_timeout_ms)
+
     async def goto_with_retry(self, page: Page, url: str, *, wait_until: str = "load") -> None:
-        """Navigate with bounded retries and navigation-failure recovery."""
         last_exc: Exception | None = None
         for attempt in range(1, self.config.max_retries + 1):
             try:
-                await page.goto(url, wait_until=wait_until, timeout=self.config.navigation_timeout_ms)
+                if urlparse(url).scheme == "file":
+                    await self._goto_file(page, url)
+                else:
+                    await page.goto(url, wait_until=wait_until, timeout=self.config.navigation_timeout_ms)
+                await self._delay()
                 return
-            except PlaywrightTimeoutError as exc:
+            except (PlaywrightTimeoutError, Exception) as exc:
                 last_exc = exc
-                logger.warning("Navigation to %s timed out (attempt %d/%d)", url, attempt, self.config.max_retries)
-            except Exception as exc:
-                last_exc = exc
-                logger.warning("Navigation to %s failed (attempt %d/%d): %s", url, attempt, self.config.max_retries, exc)
-            if attempt < self.config.max_retries:
-                await asyncio.sleep(min(2 ** attempt, 8))
-        raise NavigationError(f"Failed to navigate to {url} after {self.config.max_retries} attempts: {last_exc}")
+                logger.warning("Navigation failed (%d/%d) for %s: %s", attempt, self.config.max_retries, _safe_url(url), exc)
+                if attempt < self.config.max_retries:
+                    await asyncio.sleep(min(2 ** attempt, 8))
+        raise NavigationError(f"Failed to navigate to {_safe_url(url)} after {self.config.max_retries} attempts: {last_exc}") from last_exc
+
+    async def _delay(self) -> None:
+        if self.config.interaction_delay_ms:
+            await asyncio.sleep(self.config.interaction_delay_ms / 1000)
 
     async def extract_page_content(self, page: Page) -> PageContent:
-        """Snapshot the current page as HTML + flattened visible text.
+        """Snapshot the main document plus accessible iframe content.
 
-        The visible-text flattening walks light DOM and open shadow roots
-        via page.evaluate so that shadow-DOM content (inaccessible to a
-        BeautifulSoup pass over page.content()) is still available to the
-        extractor as text.
+        Cross-origin or otherwise inaccessible frames are skipped because
+        browser security must not be bypassed.
         """
         html = await page.content()
-        rendered_text = await page.evaluate(_FLATTEN_TEXT_JS)
+        rendered_parts = [await page.evaluate(_FLATTEN_TEXT_JS)]
+        frame_html: list[str] = []
+        for frame in page.frames:
+            if frame is page.main_frame:
+                continue
+            try:
+                frame_html.append(await frame.content())
+                frame_text = await frame.evaluate(_FLATTEN_TEXT_JS)
+                if frame_text:
+                    rendered_parts.append(frame_text)
+            except Exception:
+                logger.debug("Accessible iframe snapshot unavailable; skipping frame", exc_info=True)
+        if frame_html:
+            html += "\n<!-- TaskHelper accessible iframe snapshots -->\n" + "\n".join(frame_html)
+        rendered_text = " ".join(part for part in rendered_parts if part)
         return PageContent(html=html, rendered_text=rendered_text, url=page.url)
 
     async def close_page(self, page: Page) -> None:
@@ -161,8 +142,8 @@ class BrowserManager:
                 self._pages.remove(page)
             if not page.is_closed():
                 await page.close()
-        except Exception:  # pragma: no cover - best-effort cleanup
-            logger.debug("Error closing page", exc_info=True)
+        except Exception:
+            logger.debug("Page cleanup failed", exc_info=True)
 
     async def close(self) -> None:
         for page in list(self._pages):
@@ -170,34 +151,40 @@ class BrowserManager:
         if self._context is not None:
             try:
                 await self._context.close()
-            except Exception:  # pragma: no cover
-                logger.debug("Error closing context", exc_info=True)
+            except Exception:
+                logger.debug("Context cleanup failed", exc_info=True)
             self._context = None
         if self._browser is not None:
             try:
                 await self._browser.close()
-            except Exception:  # pragma: no cover
-                logger.debug("Error closing browser", exc_info=True)
+            except Exception:
+                logger.debug("Browser cleanup failed", exc_info=True)
             self._browser = None
-        await self._safe_stop_playwright()
+        if self._playwright is not None:
+            try:
+                await self._playwright.stop()
+            except Exception:
+                logger.debug("Playwright cleanup failed", exc_info=True)
+            self._playwright = None
 
 
-_FLATTEN_TEXT_JS = """
+_FLATTEN_TEXT_JS = r"""
 () => {
-    function collect(root, parts) {
-        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-        let node;
-        while ((node = walker.nextNode())) {
-            const value = node.nodeValue.trim();
-            if (value) parts.push(value);
-        }
-        const all = root.querySelectorAll ? root.querySelectorAll('*') : [];
-        for (const el of all) {
-            if (el.shadowRoot) collect(el.shadowRoot, parts);
-        }
+  const parts = [];
+  const seen = new Set();
+  function collect(root) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walker.nextNode())) {
+      const value = node.nodeValue.trim();
+      if (value) parts.push(value);
     }
-    const parts = [];
-    collect(document.body || document.documentElement, parts);
-    return parts.join(' ');
+    const elements = root.querySelectorAll ? root.querySelectorAll('*') : [];
+    for (const el of elements) {
+      if (el.shadowRoot && !seen.has(el.shadowRoot)) { seen.add(el.shadowRoot); collect(el.shadowRoot); }
+    }
+  }
+  collect(document.body || document.documentElement);
+  return parts.join(' ');
 }
 """
