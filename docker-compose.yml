@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  taskhelper:
+    build: .
+    container_name: taskhelper
+    environment:
+      - BROWSER_MODE=local
+      - HEADLESS=true
+      - LOG_LEVEL=INFO
+      - DATABASE_PATH=data/taskhelper.db
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
