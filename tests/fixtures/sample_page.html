@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>TaskHelper Fixture Page</title>
+</head>
+<body>
+  <h1>Introduction</h1>
+  <p>The quick brown fox jumps over the lazy dog near the riverbank at dawn every single morning without fail.</p>
+
+  <h2>History</h2>
+  <p>START-MARKER The city was founded in the year 1850 by a small group of traders END-MARKER who later built the harbor.</p>
+  <p>Population grew steadily after the railway arrived in 1902, doubling in size within twenty years.</p>
+
+  <h2>Geography</h2>
+  <p>The region is bordered by mountains to the north and a wide river delta to the south.</p>
+
+  <h3>Climate</h3>
+  <p>Summers are warm and dry while winters remain mild due to coastal influence.</p>
+
+  <h2>Notable Facts</h2>
+  <ul id="facts-list">
+    <li>First item: the tower was built in 1889.</li>
+    <li>Second item: the bridge spans two kilometers.</li>
+    <li>Third item: the museum houses over ten thousand artifacts.</li>
+  </ul>
+
+  <h2>Population Table</h2>
+  <table id="population-table">
+    <tr><th>Year</th><th>Population</th><th>Notes</th></tr>
+    <tr><td>1900</td><td>12000</td><td>Pre-railway</td></tr>
+    <tr><td>1920</td><td>28000</td><td>Post-railway boom</td></tr>
+    <tr><td>1950</td><td>61000</td><td>Post-war growth</td></tr>
+  </table>
+
+  <div id="js-content"></div>
+
+  <script>
+    document.getElementById('js-content').innerHTML =
+      '<h2>Dynamic Section</h2><p>This paragraph was rendered by JavaScript after page load and mentions the keyword rendered-content-marker for verification.</p>';
+  </script>
+</body>
+</html>
