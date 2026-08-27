@@ -1,0 +1,21 @@
+services:
+  - type: worker
+    name: taskhelper
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: BROWSER_MODE
+        value: local
+      - key: HEADLESS
+        value: "true"
+      - key: DATABASE_PATH
+        value: /app/data/taskhelper.db
+      - key: LOG_LEVEL
+        value: INFO
+    disk:
+      name: taskhelper-data
+      mountPath: /app/data
+      sizeGB: 1

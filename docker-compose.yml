@@ -1,0 +1,12 @@
+services:
+  taskhelper:
+    build: .
+    environment:
+      BROWSER_MODE: local
+      HEADLESS: "true"
+      LOG_LEVEL: INFO
+      DATABASE_PATH: /app/data/taskhelper.db
+      DISCORD_TOKEN: ${DISCORD_TOKEN:-}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
